@@ -205,6 +205,23 @@ asyn_SRCS_vxWorks += drvNi1014.c
 asyn_SRCS_RTEMS += drvNi1014.c
 DBD += drvNi1014.dbd
 
+ifeq ($(DRV_VISA),YES)
+  SRC_DIRS += $(ASYN)/drvVISA
+  asyn_SRCS += drvAsynVISAPort.cpp
+  DBD += drvAsynVISAPort.dbd
+  USR_INCLUDES += -I$(NIVISADIR)/include
+  ifneq ($(findstring windows,$(EPICS_HOST_ARCH)),)
+    asyn_LIBS += visa64
+    visa64_DIR = $(NIVISADIR)/Lib_x64
+  endif
+  ifneq ($(findstring win32,$(EPICS_HOST_ARCH)),)
+    asyn_LIBS += visa32
+    visa32_DIR = $(NIVISADIR)/Lib
+  endif
+  asyn_LIBS_Linux += visa
+  visa_DIR = $(NIVISADIR)/lib64
+endif
+
 ifeq ($(LINUX_GPIB),YES)
   SRC_DIRS += $(ASYN)/linuxGpib
   asyn_SRCS_Linux += drvLinuxGpib.c
