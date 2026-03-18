@@ -29,7 +29,9 @@ typedef struct dPvt {
     asynUser    *pasynUserTCPcommon;
     asynUser    *pasynUserTCPoctet;
     int          isConnected;
+    int          reconnectCount;
     int          autoConnect;
+    int          timeout; /* prologix inter character timeout in milliseconds */
 
     /*
      * Input/Output staging buffer
@@ -46,10 +48,16 @@ typedef struct dPvt {
     int          lastAddress;
     int          lastPrimaryAddress;
     int          lastSecondaryAddress;
-    int          eos;
+    int          eos; /* our end of read char if >= 0, also sent on send */
+    int          send_eoi;
 } dPvt;
 
+
+static dPvt *g_pdpvt;
+
 #define EOT_MARKER  0xEF
+
+#define DEFAULT_PROLOGIX_READ_TIMEOUT 500 /* default for dPvt->timeout, must be between 1 and 3000ms according to prologix manual */
 
 /*
  * Set the address of the device to which we wish to communicate.
@@ -136,7 +144,7 @@ stashChar(dPvt *pdpvt, asynUser *pasynUser, int c)
     switch (c) {
     case '\r':
     case '\n':
-    case '\033':
+    case '\033': /* escape char */
     case '+':
         pdpvt->buf[pdpvt->bufCount++] = '\033';
         break;
@@ -150,7 +158,14 @@ prologixReport(void *drvPvt, FILE *fd, int details)
 {
     dPvt *pdpvt = (dPvt *)drvPvt;
 
-    fprintf(fd, "   Version: %s\n", pdpvt->versionString);
+    fprintf(fd, "   Version:           %s\n", pdpvt->versionString);
+    fprintf(fd, "   portName:          %s\n", pdpvt->portName);
+    fprintf(fd, "   hostTCP:           %s\n", pdpvt->hostTCP);
+    fprintf(fd, "   autoConnect:       %d\n", pdpvt->autoConnect);
+    fprintf(fd, "   timeout_ms:        %d\n", pdpvt->timeout);
+    fprintf(fd, "   eos:               %d\n", pdpvt->eos);
+    fprintf(fd, "   send_eoi:          %d\n", pdpvt->send_eoi);
+    fprintf(fd, "   reconnectCount:    %d\n", pdpvt->reconnectCount);
 }
 
 static asynStatus
@@ -168,20 +183,25 @@ prologixConnect(void *drvPvt, asynUser *pasynUser)
     pdpvt->bufCount = 0;
     if ((status = pasynManager->getAddr(pasynUser, &address)) != asynSuccess)
         return status;
-    if (address < 0) {
+    if (!pdpvt->isConnected) {
         status = pasynCommonSyncIO->connectDevice(pdpvt->pasynUserTCPcommon);
         if (status != asynSuccess)
             return status;
         n = epicsSnprintf(pdpvt->buf, pdpvt->bufCapacity,
-                    "++savecfg 0\n"    /* Don't save changes in EEPROM */
-                    "++mode 1\n"       /* We are controller            */
-                    "++ifc\n"          /* Clear the bus                */
-                    "++eos 3\n"        /* Handle EOS ourselves         */
-                    "++eoi 1\n"        /* Generate EOI on output       */
-                    "++eot_char %d\n"  /* Mark EOT on input            */
-                    "++eot_enable 1\n"
-                    "++ver\n"          /* Request version information  */
+                    "++savecfg 0\n"          /* Don't save changes in EEPROM */
+                    "++auto 0\n"             /* Disable auto read after send */
+                    "++read_tmo_ms %d\n"     /* set inter character timeout  */
+                    "++mode 1\n"             /* We are controller            */
+                    "++ifc\n"                /* Clear the bus                */
+                    "++eos 3\n"              /* Handle EOS ourselves         */
+                    "++eoi %d\n"             /* Generate EOI on output       */
+                    "++eot_char %d\n"        /* Mark EOT on input            */
+                    "++eot_enable %d\n"
+                    "++ver\n"                /* Request version information  */
+                    , pdpvt->timeout
+                    , pdpvt->send_eoi
                     , EOT_MARKER
+                    , (pdpvt->eos < 0 ? 1 : 0)
                     );
         status = pasynOctetSyncIO->write(pdpvt->pasynUserTCPoctet, pdpvt->buf,
                                                                 n, 1.0, &nt);
@@ -209,6 +229,8 @@ prologixConnect(void *drvPvt, asynUser *pasynUser)
                 break;
             }
         }
+        pdpvt->isConnected = 1;
+        ++(pdpvt->reconnectCount);
     }
     pasynManager->exceptionConnect(pasynUser);
     return asynSuccess;
@@ -223,8 +245,12 @@ prologixDisconnect(void *drvPvt, asynUser *pasynUser)
 
     if ((status = pasynManager->getAddr(pasynUser, &address)) != asynSuccess)
         return status;
+    if (!pdpvt->isConnected) {
+        return asynError;
+    }
     if (address < 0) {
         status = pasynCommonSyncIO->disconnectDevice(pdpvt->pasynUserTCPcommon);
+        pdpvt->isConnected = 0;
         if (status != asynSuccess)
             return status;
     }
@@ -242,6 +268,7 @@ prologixRead(void *drvPvt, asynUser *pasynUser,
     dPvt *pdpvt = (dPvt *)drvPvt;
     size_t n;
     int eom;
+    *nbytesTransfered = 0;
 
     /*
      * Get entire reply on first invocation of this method following
@@ -276,7 +303,6 @@ prologixRead(void *drvPvt, asynUser *pasynUser,
         /*
          * Read until we see the appropriate terminator
          */
-        *nbytesTransfered = 0;
         for (;;)  {
             /*
              * Ensure that there's space for the read
@@ -344,9 +370,9 @@ prologixRead(void *drvPvt, asynUser *pasynUser,
         eom |= ASYN_EOM_CNT;
     }
     memcpy(data, pdpvt->buf + pdpvt->bufIndex, n);
-     pdpvt->bufIndex += n;
+    pdpvt->bufIndex += n;
     if (eomReason) *eomReason = eom;
-    *nbytesTransfered = n;
+    *nbytesTransfered = (int)n;
     asynPrintIO(pasynUser, ASYN_TRACEIO_DRIVER, data, n,
                                 "%s %d prologixRead %d EOM:%#x\n",
                                 pdpvt->portName, pdpvt->lastAddress, (int)n, eom);
@@ -360,6 +386,7 @@ prologixWrite(void *drvPvt, asynUser *pasynUser,
     dPvt *pdpvt = (dPvt *)drvPvt;
     size_t n, nt;
     asynStatus status;
+    *nbytesTransfered = 0;
 
     /*
      * Check for output buffer space.
@@ -381,7 +408,6 @@ prologixWrite(void *drvPvt, asynUser *pasynUser,
      */
     asynPrintIO(pasynUser, ASYN_TRACEIO_DRIVER, data, numchars,
                  "%s %d prologixWrite\n", pdpvt->portName, pdpvt->lastAddress);
-    *nbytesTransfered = 0;
     n = numchars;
     pdpvt->bufCount = 0;
     while (n) {
@@ -398,12 +424,18 @@ prologixWrite(void *drvPvt, asynUser *pasynUser,
         }
     }
     pdpvt->buf[pdpvt->bufCount++] = '\n';
+    asynPrintIO(pasynUser, ASYN_TRACEIO_DRIVER, pdpvt->buf, pdpvt->bufCount,
+                 "%s %d prologixWriteRaw\n", pdpvt->portName, pdpvt->lastAddress);
 
     /*
      * Send the command
      */
     status = pasynOctetSyncIO->write(pdpvt->pasynUserTCPoctet, pdpvt->buf,
                                     pdpvt->bufCount, pasynUser->timeout, &nt);
+    if (status == asynDisconnected) {
+        prologixDisconnect(drvPvt, pasynUser);
+        prologixDisconnect(drvPvt, pdpvt->pasynUserTCPcommon);
+    }
     if (status == asynSuccess)
         *nbytesTransfered = numchars;
     pdpvt->bufCount = 0;
@@ -453,8 +485,9 @@ prologixSetEos(void *drvPvt, asynUser *pasynUser, const char *eos, int eoslen)
     }
     if (pdpvt->eos == newEos)
         return asynSuccess;
+    pdpvt->eos = newEos;
     n = epicsSnprintf(pdpvt->buf, pdpvt->bufCapacity, "++eot_enable %d\n",
-                                                                (pdpvt->eos < 0));
+                                                                (pdpvt->eos < 0 ? 1 : 0));
     return pasynOctetSyncIO->write(pdpvt->pasynUserTCPoctet, pdpvt->buf, n, 1.0, &nt);
 }
 
@@ -462,15 +495,56 @@ static asynStatus
 prologixAddressedCmd(void *drvPvt, asynUser *pasynUser,
                      const char *data, int length)
 {
-    epicsSnprintf(pasynUser->errorMessage, pasynUser->errorMessageSize, "prologixAddressedCmd unimplemented");
-    return asynError;
+    dPvt *pdpvt = (dPvt *)drvPvt;
+    size_t n = 0, nt;
+    int cmd = 0;
+    int addr;
+    asynStatus status = asynSuccess;
+    if (length > 3) {
+        cmd = data[3];
+    }
+    asynPrint(pasynUser, ASYN_TRACE_FLOW,
+        "%s prologixAddressedCmd %2.2x\n",pdpvt->portName,cmd);
+    status = pasynManager->getAddr(pasynUser,&addr);
+    if(status!=asynSuccess) return status;
+    /* sort out addressing if needed, data[2] = pasynRec->addr + LADBASE if from asyn record
+       we may need to swap current address of gpib device */
+    if (cmd == IBGTL[0]) {
+        n = epicsSnprintf(pdpvt->buf, pdpvt->bufCapacity, "++loc\n");
+    } else {
+        epicsSnprintf(pasynUser->errorMessage, pasynUser->errorMessageSize, "prologixAddressedCmd %2.2x unimplemented",cmd);
+        status = asynError;
+    }
+    if (n > 0) {
+        status = pasynOctetSyncIO->write(pdpvt->pasynUserTCPoctet, pdpvt->buf, n, 1.0, &nt);
+    }
+    return status;
 }
 
 static asynStatus
 prologixUniversalCmd(void *drvPvt, asynUser *pasynUser, int cmd)
 {
-    epicsSnprintf(pasynUser->errorMessage, pasynUser->errorMessageSize, "prologixUniversalCmd unimplemented");
-    return asynError;
+    dPvt *pdpvt = (dPvt *)drvPvt;
+    size_t n = 0, nt;
+    asynStatus status = asynSuccess;
+    asynPrint(pasynUser, ASYN_TRACE_FLOW,
+        "%s prologixUniversalCmd %2.2x\n",pdpvt->portName,cmd);
+    switch(cmd) {
+        case IBLLO:
+            n = epicsSnprintf(pdpvt->buf, pdpvt->bufCapacity, "++llo\n");
+            break;
+        case IBDCL:
+            n = epicsSnprintf(pdpvt->buf, pdpvt->bufCapacity, "++clr\n");
+            break;
+        default:
+            epicsSnprintf(pasynUser->errorMessage, pasynUser->errorMessageSize, "prologixUniversalCmd %2.2x unimplemented",cmd);
+            status = asynError;
+            break;
+    }
+    if (n > 0) {
+        status = pasynOctetSyncIO->write(pdpvt->pasynUserTCPoctet, pdpvt->buf, n, 1.0, &nt);
+    }
+    return status;
 }
 
 static asynStatus
@@ -486,8 +560,13 @@ prologixIfc(void *drvPvt, asynUser *pasynUser)
 static asynStatus
 prologixRen(void *drvPvt, asynUser *pasynUser, int onOff)
 {
-    epicsSnprintf(pasynUser->errorMessage, pasynUser->errorMessageSize, "prologixRen unimplemented");
-    return asynError;
+    dPvt *pdpvt = (dPvt *)drvPvt;
+    size_t n, nt;
+    asynPrint(pasynUser, ASYN_TRACE_FLOW,
+        "%s prologixRen %d\n",pdpvt->portName,onOff);
+
+    n = epicsSnprintf(pdpvt->buf, pdpvt->bufCapacity, (onOff ? "++llo\n" : "++loc\n"));
+    return pasynOctetSyncIO->write(pdpvt->pasynUserTCPoctet, pdpvt->buf, n, 1.0, &nt);
 }
 
 static asynStatus
@@ -558,6 +637,9 @@ prologixGPIBConfigure(const char *portName, const char *host, int priority, int 
     pdpvt->bufCapacity = 4096;
     pdpvt->buf = callocMustSucceed(1, pdpvt->bufCapacity, portName);
     pdpvt->eos = -1;
+    pdpvt->timeout = DEFAULT_PROLOGIX_READ_TIMEOUT;
+    pdpvt->send_eoi = 1;
+    pdpvt->reconnectCount = 0;
 
     /*
      * Create the port that we'll use for I/O.
@@ -600,6 +682,37 @@ prologixGPIBConfigure(const char *portName, const char *host, int priority, int 
         printf("registerPort failed\n");
         return;
     }
+    g_pdpvt = pdpvt;
+}
+
+static void
+prologixGPIBSetOption(const char *portName, const char *option, const char* value)
+{
+    size_t n = 0, nt;
+    if (portName == NULL) {
+        printf("prologixGPIBSetOption: portName NULL\n");
+        return;
+    } else if (option == NULL) {
+        printf("prologixGPIBSetOption: option NULL\n");
+        return;
+    } else if (value == NULL) {
+        printf("prologixGPIBSetOption: value NULL\n");
+        return;
+    }
+    if (!strcmp("timeout_ms", option)) {
+        int timeout = atoi(value);
+        /* timeout must be between 1 and 3000ms according to prologix manual */
+        g_pdpvt->timeout = (timeout > 0 ? (timeout < 3000 ? timeout : 3000) : DEFAULT_PROLOGIX_READ_TIMEOUT);
+        n = epicsSnprintf(g_pdpvt->buf, g_pdpvt->bufCapacity, "++read_tmo_ms %d\n", g_pdpvt->timeout );
+    } else if (!strcmp("send_eoi", option)) {
+        g_pdpvt->send_eoi = (atoi(value) != 0 ? 1 : 0);
+        n = epicsSnprintf(g_pdpvt->buf, g_pdpvt->bufCapacity, "++eoi %d\n", g_pdpvt->send_eoi);
+    } else {
+        printf("prologixGPIBSetOption: unknown option \"%s\"\n", option);
+    }
+    if (n > 0) {
+        pasynOctetSyncIO->write(g_pdpvt->pasynUserTCPoctet, g_pdpvt->buf, n, 1.0, &nt);
+    }
 }
 
 /*
@@ -611,18 +724,37 @@ static const iocshArg prologixGPIBConfigureArg2 = { "priority",iocshArgInt};
 static const iocshArg prologixGPIBConfigureArg3 = { "noAutoConnect",iocshArgInt};
 static const iocshArg *prologixGPIBConfigureArgs[] = {
                     &prologixGPIBConfigureArg0, &prologixGPIBConfigureArg1,
-                    &prologixGPIBConfigureArg2, &prologixGPIBConfigureArg3 };
+                    &prologixGPIBConfigureArg2, &prologixGPIBConfigureArg3,
+     };
 static const iocshFuncDef prologixGPIBConfigureFuncDef =
       {"prologixGPIBConfigure", 4, prologixGPIBConfigureArgs};
+
+
+static const iocshArg prologixGPIBSetOptionArg0 = { "port",iocshArgString};
+static const iocshArg prologixGPIBSetOptionArg1 = { "option",iocshArgString};
+static const iocshArg prologixGPIBSetOptionArg2 = { "value",iocshArgString};
+static const iocshArg *prologixGPIBSetOptionArgs[] = {
+                    &prologixGPIBSetOptionArg0, &prologixGPIBSetOptionArg1,
+                    &prologixGPIBSetOptionArg2};
+static const iocshFuncDef prologixGPIBSetOptionFuncDef =
+      {"prologixGPIBSetOption", 3, prologixGPIBSetOptionArgs};
+
 static void prologixGPIBConfigureCallFunc(const iocshArgBuf *args)
 {
     prologixGPIBConfigure(args[0].sval, args[1].sval,
                           args[2].ival, args[3].ival);
 }
 
+static void prologixGPIBSetOptionCallFunc(const iocshArgBuf *args)
+{
+    prologixGPIBSetOption(args[0].sval, args[1].sval,
+                          args[2].sval);
+}
+
 static void
 drvPrologixGPIB_RegisterCommands(void)
 {
     iocshRegister(&prologixGPIBConfigureFuncDef,prologixGPIBConfigureCallFunc);
+    iocshRegister(&prologixGPIBSetOptionFuncDef,prologixGPIBSetOptionCallFunc);
 }
 epicsExportRegistrar(drvPrologixGPIB_RegisterCommands);
