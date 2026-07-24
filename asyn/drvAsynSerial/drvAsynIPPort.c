@@ -527,7 +527,7 @@ connectIt(void *drvPvt, asynUser *pasynUser)
         if (tty->socketType != SOCK_DGRAM) {
             int connectResult = connect(fd, &tty->farAddr.oa.sa, (int)tty->farAddrSize);
         #ifdef USE_POLL
-            if (connectResult < 0 && ((SOCKERRNO == EWOULDBLOCK) || (SOCKERRNO == EINPROGRESS))) {
+            if (connectResult < 0 && ((SOCKERRNO == SOCK_EWOULDBLOCK) || (SOCKERRNO == SOCK_EINPROGRESS))) {
                 double connectTimeout;
                 int msConnectTimeout;
                 struct pollfd pollfd;
