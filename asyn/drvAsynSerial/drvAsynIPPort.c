@@ -532,6 +532,11 @@ connectIt(void *drvPvt, asynUser *pasynUser)
          */
         if (tty->socketType != SOCK_DGRAM) {
             int connectResult = connect(fd, &tty->farAddr.oa.sa, (int)tty->farAddrSize);
+            if (connectResult < 0) {
+                 /* save error message in case we need it later as if we call poll()
+                  * next it could change */
+                epicsSocketConvertErrnoToString(sockerrmsg, sizeof(sockerrmsg));
+            }
         #ifdef USE_POLL
             if (connectResult < 0 && ((SOCKERRNO == SOCK_EWOULDBLOCK) || (SOCKERRNO == SOCK_EINPROGRESS))) {
                 double connectTimeout;
@@ -561,7 +566,6 @@ connectIt(void *drvPvt, asynUser *pasynUser)
             }
         #endif
             if (connectResult < 0) {
-                epicsSocketConvertErrnoToString(sockerrmsg, sizeof(sockerrmsg));
                 epicsSnprintf(pasynUser->errorMessage,pasynUser->errorMessageSize,
                               "Can't connect to %s: %s",
                               tty->IPDeviceName, sockerrmsg);
